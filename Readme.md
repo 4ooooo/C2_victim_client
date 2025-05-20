@@ -1,0 +1,1 @@
+win编译方式：go build -ldflags="-H=windowsgui" -o client.exe main.go
