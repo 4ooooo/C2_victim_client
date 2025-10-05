@@ -643,48 +643,35 @@ func convertGBKToUTF8(gbkBytes []byte) string {
 		return ""
 	}
 
-	fmt.Printf("[调试] 开始GBK转换 - 输入字节数: %d\n", len(gbkBytes))
-	fmt.Printf("[调试] 输入数据前50字节: %v\n", func() []byte {
-		if len(gbkBytes) > 50 {
-			return gbkBytes[:50]
-		}
-		return gbkBytes
-	}())
+	// 检查是否已经是有效的UTF-8
+	if utf8.Valid(gbkBytes) {
+		return string(gbkBytes)
+	}
 
 	// 尝试GBK到UTF-8转换
 	decoder := simplifiedchinese.GBK.NewDecoder()
 	utf8Bytes, _, err := transform.Bytes(decoder, gbkBytes)
 	if err != nil {
-		fmt.Printf("[调试] GBK转换失败: %v\n", err)
-		// 如果转换失败，尝试其他方法
-
-		// 检查是否已经是UTF-8
-		if utf8.Valid(gbkBytes) {
-			fmt.Printf("[调试] 数据已经是有效的UTF-8，直接使用\n")
-			return string(gbkBytes)
-		}
-
-		// 如果不是有效UTF-8，尝试作为CP936处理
+		// 如果GBK转换失败，尝试GB18030
 		decoder936 := simplifiedchinese.GB18030.NewDecoder()
 		utf8Bytes, _, err2 := transform.Bytes(decoder936, gbkBytes)
-		if err2 == nil {
-			fmt.Printf("[调试] 使用GB18030成功转换\n")
-			result := string(utf8Bytes)
-			fmt.Printf("[调试] 转换完成 - 输出字符数: %d\n", len(result))
-			return result
+		if err2 != nil {
+			// 所有转换都失败，使用原始数据并替换无效字符
+			return strings.ToValidUTF8(string(gbkBytes), "?")
 		}
-
-		fmt.Printf("[调试] 所有转换方法均失败，使用原始字符串\n")
-		return string(gbkBytes)
+		// 使用GB18030转换的结果
+		result := string(utf8Bytes)
+		// 确保结果是有效的UTF-8
+		if !utf8.ValidString(result) {
+			result = strings.ToValidUTF8(result, "?")
+		}
+		return result
 	}
 
 	result := string(utf8Bytes)
-	fmt.Printf("[调试] GBK到UTF-8转换成功 - 输入字节: %d，输出UTF-8字节: %d，字符数: %d\n",
-		len(gbkBytes), len(utf8Bytes), len(result))
 
-	// 验证转换结果的UTF-8有效性
+	// 确保结果是有效的UTF-8
 	if !utf8.ValidString(result) {
-		fmt.Printf("[调试] 警告：转换结果包含无效UTF-8字符\n")
 		result = strings.ToValidUTF8(result, "?")
 	}
 
